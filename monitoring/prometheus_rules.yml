@@ -1,0 +1,98 @@
+groups:
+  - name: dps.slo
+    interval: 30s
+    rules:
+
+      # API availability SLO (99.9%)
+      - alert: APIAvailabilityBreach
+        expr: |
+          (1 - rate(http_requests_total{status=~"5.."}[5m]) /
+               rate(http_requests_total[5m])) < 0.999
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API availability below 99.9% SLO"
+          description: "Error rate {{ $value | humanizePercentage }} over last 5m"
+
+      # P99 latency SLO (< 2s)
+      - alert: LatencyP99Breach
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_request_duration_seconds_bucket[5m])
+          ) > 2.0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P99 latency exceeds 2s SLO"
+          description: "P99={{ $value }}s on {{ $labels.endpoint }}"
+
+      # Dead Letter Queue accumulation
+      - alert: DLQGrowing
+        expr: increase(dps_dlq_entries_total[10m]) > 3
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead Letter Queue accumulating failed tasks"
+          description: "{{ $value }} new DLQ entries in last 10 minutes"
+
+      # Celery worker down
+      - alert: CeleryWorkerDown
+        expr: celery_workers_active < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No active Celery workers"
+          description: "All background job workers are offline"
+
+      # High error rate on upload
+      - alert: UploadErrorRateHigh
+        expr: |
+          rate(http_requests_total{endpoint="/api/v1/datasets",status=~"4.."}[5m])
+          / rate(http_requests_total{endpoint="/api/v1/datasets"}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High upload error rate (>10%)"
+
+      # Database connection pool exhausted
+      - alert: DBConnectionPoolExhausted
+        expr: sqlalchemy_pool_overflow > 5
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DB connection pool overflow"
+
+      # Redis memory pressure
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis memory usage above 85%"
+
+      # Login brute force detection
+      - alert: BruteForceDetected
+        expr: |
+          rate(dps_login_failures_total[5m]) > 10
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Possible brute force attack"
+          description: "{{ $value }} failed logins/s in last 5 minutes"
+
+      # CSV injection attempts
+      - alert: CSVInjectionAttempts
+        expr: increase(dps_csv_injections_total[1h]) > 10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple CSV injection attempts detected"

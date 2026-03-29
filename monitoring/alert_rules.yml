@@ -1,0 +1,97 @@
+groups:
+  - name: dps_alerts
+    interval: 30s
+    rules:
+
+      # ── SLA Alerts ────────────────────────────────────────────
+      - alert: HighP95Latency
+        expr: histogram_quantile(0.95, rate(dps_http_request_duration_seconds_bucket[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency > 1000ms for 2 minutes"
+          description: "p95 is {{ $value | humanizeDuration }}. SLA target: <1000ms"
+
+      - alert: HighP99Latency
+        expr: histogram_quantile(0.99, rate(dps_http_request_duration_seconds_bucket[5m])) > 2.0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "p99 latency > 2000ms"
+
+      - alert: HighErrorRate
+        expr: rate(dps_http_errors_total[5m]) / rate(dps_http_requests_total[5m]) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error rate > 1% for 2 minutes"
+          description: "Error rate: {{ $value | humanizePercentage }}"
+
+      # ── Infrastructure Alerts ─────────────────────────────────
+      - alert: BackendDown
+        expr: up{job="dps-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DPS backend is down"
+
+      - alert: DLQGrowing
+        expr: dps_dlq_items_total > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dead Letter Queue has >100 items — tasks are failing"
+
+      - alert: DLQCritical
+        expr: dps_dlq_items_total > 500
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead Letter Queue CRITICAL — >500 failed tasks"
+
+      - alert: PostgreSQLDown
+        expr: pg_up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is unreachable"
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is unreachable — jobs and idempotency affected"
+
+      - alert: CeleryWorkerNoHeartbeat
+        expr: absent(celery_worker_up) or celery_worker_up == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Celery worker lost — background jobs not processing"
+
+      # ── Business Alerts ───────────────────────────────────────
+      - alert: NoPipelineExecutionsLastHour
+        expr: increase(dps_pipeline_executions_total[1h]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No pipeline executions in the last hour — possible stuck queue"
+
+      - alert: HighPipelineFailureRate
+        expr: rate(dps_pipeline_executions_total{status="failure"}[10m]) / rate(dps_pipeline_executions_total[10m]) > 0.20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline failure rate > 20%"

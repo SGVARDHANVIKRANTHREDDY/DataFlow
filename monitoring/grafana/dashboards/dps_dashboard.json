@@ -1,0 +1,43 @@
+{
+  "__inputs": [],
+  "__requires": [{"type": "panel", "id": "graph"}, {"type": "datasource", "id": "prometheus"}],
+  "annotations": {"list": []},
+  "description": "Data Pipeline Studio — Production Dashboard",
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 1,
+  "id": null,
+  "title": "Data Pipeline Studio",
+  "uid": "dps-main",
+  "panels": [
+    {
+      "id": 1, "title": "Request Rate (req/s)", "type": "graph", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "rate(dps_http_requests_total[1m])", "legendFormat": "{{method}} {{path}}"}]
+    },
+    {
+      "id": 2, "title": "p95 Response Time (ms)", "type": "graph", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{"expr": "histogram_quantile(0.95, rate(dps_http_request_duration_seconds_bucket[5m])) * 1000", "legendFormat": "p95"}]
+    },
+    {
+      "id": 3, "title": "Error Rate (%)", "type": "graph", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [{"expr": "rate(dps_http_errors_total[1m]) / rate(dps_http_requests_total[1m]) * 100", "legendFormat": "Error %"}]
+    },
+    {
+      "id": 4, "title": "Pipeline Executions", "type": "graph", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [{"expr": "rate(dps_pipeline_executions_total[5m])", "legendFormat": "{{status}}"}]
+    },
+    {
+      "id": 5, "title": "Dead Letter Queue Size", "type": "stat", "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16},
+      "targets": [{"expr": "dps_dlq_items_total", "legendFormat": "DLQ Size"}],
+      "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 100}]}
+    },
+    {
+      "id": 6, "title": "Dataset Uploads / min", "type": "stat", "gridPos": {"h": 4, "w": 6, "x": 6, "y": 16},
+      "targets": [{"expr": "rate(dps_dataset_uploads_total[1m]) * 60", "legendFormat": "Uploads/min"}]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 30,
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {}
+}
