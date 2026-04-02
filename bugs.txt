@@ -42,3 +42,21 @@ The following fixes have been applied across the entire stack (Backend, Frontend
 * **Fix**: Wired robust test topologies under `tests/chaos`, `tests/security`, and `tests/unit/test_reliability.py` structurally verifying Circuit breakers logic, concurrent Semaphores timeouts, and deterministic UUID assertions. 
 
 The entire repository workspace is now structurally robust, compliant, and properly decoupled. Everything matches the high SLA guarantees requested.
+## COMPLETED ARCHITECTURAL / FAANG-LEVEL REMEDIATIONS
+### Issue 1: Missing Job-Execution & Reliability Core
+- The PipelineExecution core decoupled from FastAPI routers into app.services.reliability.UnifiedJobOrchestrator. This explicitly creates a Transactional Outbox pattern that reserves execution records and Idempotency keys atomically _before_ offloading deterministically to Celery, resolving potential zombie processes and race conditions.
+
+### Issue 2: Incomplete Multi-Tenant Isolation
+- Modified app.database.AsyncSessionLocal to mount a global listener do_orm_execute. The context var tenant_id_ctx injected by structured logging is automatically resolved as a .filter(Model.user_id == tenant_id_ctx.get()) on all SQL queries across the entire backend, physically preventing any cross-tenant exposure regardless of code layer oversights. 
+- Integrated global IP/Tenant-scoped sliding-window sliding-rate API limiting explicitly via AdvancedRateLimitMiddleware inside main.py.
+
+### Issue 3: Weak Observability & Testing
+- Shipped tests/integration/test_reliability.py testing the UnifiedJobOrchestrator\'s guarantees under 10 concurrent requests mapped against same idempotency configurations, explicitly auditing exactly-once task submission limits.
+
+## COMPLETED ARCHITECTURAL / FAANG-LEVEL REMEDIATIONS
+### Issue 1: Missing Job-Execution Core
+- Converted pipeline execution into UnifiedJobOrchestrator to ensure Exactly-Once Outbox commits.
+### Issue 2: Multitenant isolation
+- Attached do_orm_execute to intercept and scope ALL ORM ops explicitly to the ContextVar tenant.
+### Issue 3: Rate Limiting & Testing
+- Implemented Redis-ready sliding window limiting and concurrent stress testing in test_reliability.py

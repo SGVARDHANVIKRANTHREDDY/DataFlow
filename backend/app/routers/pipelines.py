@@ -101,92 +101,28 @@ async def execute(
     pid: int,
     body: ExecuteRequest,
     request: Request,
-    # Layer 1: API-level idempotency key REQUIRED for execute
     idem_key: str = Depends(require_idempotency_key),
     db: AsyncSession = Depends(write_db),
     user: User = Depends(get_current_user),
 ):
-    """
-    Exactly-once execution with two-layer deduplication:
-
-    Layer 1 (API): require_idempotency_key dependency ensures client sends
-                   Idempotency-Key header — handles network retries.
-
-    Layer 2 (Execution dedup): claim_execution_dedup uses deterministic key
-                   f"exec:{user_id}:{pipeline_id}:{dataset_id}" — handles
-                   cases where client sends different keys on retry.
-
-    Both layers required for true exactly-once.
-    """
-    pipe = await _req_pipe(db, pid, user.id)
-    ds   = await _req_dataset(db, body.dataset_id, user.id)
-
-    # Layer 1: API idempotency — check for replay
-    body_bytes = await request.body()
-    idem_result = await get_or_create_idempotency_key(
-        db, user.id, idem_key, f"/pipelines/{pid}/execute", hash_request_body(body_bytes)
-    )
-    if idem_result["action"] == "replay":
-        return idem_result["body"]
-
     try:
-        # Layer 2: Execution deduplication — prevents duplicate even with different Idempotency-Key
-        dedup_result = await claim_execution_dedup(db, user.id, pid, body.dataset_id, pipe.steps)
-        if dedup_result["action"] == "duplicate":
-            # Same pipeline+dataset ran recently — return previous execution
-            result = {
-                "execution_id": dedup_result.get("existing_execution_id"),
-                "job_id": None,
-                "status": "deduplicated",
-                "message": dedup_result.get("message"),
-            }
-            await complete_idempotency_key(db, user.id, idem_key, 202, result)
-            return result
-
-        # Pre-validate steps
-        schema_warnings = detect_schema_mismatch(pipe.steps, ds.headers or [])
-
-        execution = PipelineExecution(
-            pipeline_id=pid, input_dataset_id=body.dataset_id,
-            status="pending", schema_warnings=schema_warnings or None,
-            idempotency_key=idem_key,
+        from ..services.reliability import UnifiedJobOrchestrator
+        from ..services.security.idempotency import hash_request_body
+        
+        body_bytes = await request.body()
+        result = await UnifiedJobOrchestrator.dispatch_pipeline_execution(
+            db, user.id, pid, body.dataset_id, idem_key, hash_request_body(body_bytes)
         )
-        db.add(execution); await db.flush(); await db.refresh(execution)
-
-        job = Job(user_id=user.id, job_type="execute",
-                  payload={"pipeline_id": pid, "dataset_id": body.dataset_id,
-                           "execution_id": execution.id}, status="pending")
-        db.add(job); await db.flush(); await db.refresh(job)
-        await db.commit()
-
-        # Dispatch with deterministic task_id for retry-safe exactly-once
-        deterministic_task_id = f"exec-{execution.id}"
-        task = execute_pipeline_task.apply_async(
-            args=[execution.id, pid, body.dataset_id, user.id, job.id, pipe.steps],
-            kwargs=inject_trace_into_celery_kwargs({}),
-            task_id=deterministic_task_id,
-        )
-        execution.job_id = task.id
-        job.celery_task_id = task.id
-        await db.commit()
-
-        # Complete both idempotency layers
-        result = {"execution_id": execution.id, "job_id": job.id,
-                  "celery_task_id": task.id, "status": "pending"}
-        await complete_idempotency_key(db, user.id, idem_key, 202, result)
-        await complete_execution_dedup(db, user.id, pid, body.dataset_id, pipe.steps, execution.id)
-        await db.commit()
-
-        await audit(db, AuditAction.PIPELINE_EXECUTE, user_id=user.id,
-                    resource_type="pipeline", resource_id=pid,
-                    detail={"execution_id": execution.id, "dataset_id": body.dataset_id,
-                            "idem_key": idem_key[:8]}, request=request)
-        logger.info("Execution %d dispatched (task %s)", execution.id, task.id)
         return result
+    except ValueError as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        from fastapi import HTTPException
+        import logging
+        logging.getLogger(__name__).exception("Transactional Execution failed")
+        raise HTTPException(status_code=500, detail="Transactional Execution failed")
 
-    except Exception:
-        await fail_idempotency_key(db, user.id, idem_key)
-        raise
 
 
 @router.get("/metrics/activity")

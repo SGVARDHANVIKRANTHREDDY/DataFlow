@@ -94,6 +94,9 @@ app.add_middleware(
     expose_headers=["X-Request-ID", "X-Trace-ID"],
 )
 
+from .middleware.rate_limit import AdvancedRateLimitMiddleware
+app.add_middleware(AdvancedRateLimitMiddleware)
+
 # Tracing (correlation IDs + optional OTEL)
 app.add_middleware(TracingMiddleware)
 
