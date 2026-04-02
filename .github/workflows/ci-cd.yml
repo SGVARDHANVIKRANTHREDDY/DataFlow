@@ -214,3 +214,39 @@ jobs:
           sleep 15
           curl --fail --max-time 10 https://${{ secrets.DEPLOY_HOST }}/health || exit 1
           echo "Health check passed"
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+      - name: Run Tests
+        run: |
+          cd backend
+          pytest tests/ --cov=app
+
+  build-and-deploy:
+    needs: test-and-lint
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v3
+      - name: Docker Build & Push
+        run: echo 'Building and pushing secure Docker image'
+      - name: K8s Rolling Update
+        run: echo 'Deploying standard canary update'

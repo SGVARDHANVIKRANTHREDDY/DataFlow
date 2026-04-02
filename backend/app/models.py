@@ -210,3 +210,17 @@ class DeadLetterEntry(Base):
     replayed: Mapped[bool]     = mapped_column(Boolean, default=False)
     replayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class DeadLetterQueue(Base):
+    __tablename__ = 'dead_letter_queue'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(255), index=True)
+    task_name: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[str] = mapped_column(Text)
+    error_class: Mapped[str] = mapped_column(String(255))
+    error_message: Mapped[str] = mapped_column(Text)
+    stack_trace: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    status: Mapped[str] = mapped_column(String(50), default='pending') # pending, resolved, dropped
+    resolved_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)

@@ -1,6 +1,6 @@
 """Async SQLAlchemy engine — v7. Primary engine for write operations and legacy compat."""
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import DeclarativeBase, ORMExecuteState
+from sqlalchemy.orm import DeclarativeBase, ORMExecuteState, Session
 from sqlalchemy import event, and_
 from .config import get_settings
 from .middleware.logging import tenant_id_ctx
@@ -26,7 +26,7 @@ AsyncSessionLocal = async_sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False, autoflush=False,
 )
 
-@event.listens_for(AsyncSessionLocal.class_, 'do_orm_execute')
+@event.listens_for(Session, 'do_orm_execute')
 def _add_tenant_filter(execute_state: ORMExecuteState):
     """
     FAANG Requirement: Multi-user isolation is rigorously enforced physically
@@ -49,6 +49,17 @@ def _add_tenant_filter(execute_state: ORMExecuteState):
 
 
 
+class DBWatcher:
+    async def execute(self, *args, **kwargs):
+        from .services.reliability import db_circuit_breaker
+        db_circuit_breaker.check()
+        try:
+            # Simple simulation of wrapper without heavy meta classing
+            pass
+        except Exception:
+            db_circuit_breaker.record_failure()
+            raise
+
 class Base(DeclarativeBase):
     pass
 
@@ -69,3 +80,5 @@ async def create_tables() -> None:
     """Tests only. Production uses Alembic."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+

@@ -169,13 +169,13 @@ def execute_pipeline(
     # Final collect
     with tracer.start_as_current_span(f"pipeline.final_collect") as span:
         try:
-        if use_streaming:
-            final_polars = last_good_lf.collect(streaming=True)
-        else:
-            final_polars = last_good_lf.collect()
-    except Exception as e:
-        logger.error("Final collect failed: %s", e)
-        final_polars = pl.DataFrame()
+            if use_streaming:
+                final_polars = last_good_lf.collect(streaming=True)
+            else:
+                final_polars = last_good_lf.collect()
+        except Exception as e:
+            logger.error("Final collect failed: %s", e)
+            final_polars = pl.DataFrame()
 
     # Convert back to pandas for compatibility with the rest of the system
     try:

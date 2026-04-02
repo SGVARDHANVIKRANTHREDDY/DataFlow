@@ -18,7 +18,8 @@ import pandas as pd
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from .config import get_settings
+from app.config import get_settings
+from app.services.reliability import with_retry_and_circuit, s3_circuit_breaker
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ def _get_aioboto3():
         return None
 
 
+@with_retry_and_circuit(s3_circuit_breaker, exceptions=(Exception,), max_retries=3)
 async def upload_file_async(data: bytes | BinaryIO, key: str, bucket: str,
                              content_type: str = "text/csv") -> str:
     _check_circuit()
@@ -231,3 +233,7 @@ def generate_upload_key(user_id: int, filename: str) -> str:
     import uuid
     safe = filename.replace(" ", "_")[:100]
     return f"users/{user_id}/raw/{uuid.uuid4().hex}_{safe}"
+
+async def upload_csv_from_df_async(df: pd.DataFrame, prefix: str, bucket: str) -> str:
+    import asyncio
+    return await asyncio.to_thread(upload_csv_from_df, df, prefix, bucket)

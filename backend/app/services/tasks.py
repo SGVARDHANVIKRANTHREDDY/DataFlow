@@ -20,7 +20,7 @@ from celery import Task
 from celery.exceptions import SoftTimeLimitExceeded
 
 from ..celery_app import celery_app
-from ..config import get_settings
+from app.config import get_settings
 from .storage import download_to_df, upload_csv_from_df_sync
 from .profiler import profile_dataframe, generate_smart_suggestions
 from .executor import execute_pipeline
@@ -36,13 +36,54 @@ WORKER_ID = f"{socket.gethostname()}-{__import__('os').getpid()}"
 
 
 class DBTask(Task):
+    """
+    FAANG-grade Job Base Class:
+    Integrates DB session lifecycle, standardizes timeout/retry behavior,
+    and handles automatic routing of permanent failures to a true DLQ table
+    (DeadLetterQueue) with complete payload and stack trace instrumentation.
+    """
     abstract = True
+    
     def run_in_loop(self, coro):
         loop = asyncio.new_event_loop()
         try:
             return loop.run_until_complete(coro)
         finally:
             loop.close()
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        """
+        Catches failures that exceeded max_retries and dumps them to DLQ
+        so operators can inspect and re-drive manually.
+        """
+        import json
+        import traceback
+        from ..database import AsyncSessionLocal
+        from app.models import DeadLetterQueue
+        
+        async def _log_dlq():
+            async with AsyncSessionLocal() as db:
+                try:
+                    # Sanitize args/kwargs for JSON storage
+                    safe_args = [str(a) for a in args]
+                    safe_kwargs = {k: str(v) for k, v in kwargs.items()}
+                    
+                    dlq_item = DeadLetterQueue(
+                        task_id=task_id,
+                        task_name=self.name,
+                        payload=json.dumps({"args": safe_args, "kwargs": safe_kwargs}),
+                        error_class=exc.__class__.__name__,
+                        error_message=str(exc),
+                        stack_trace=str(einfo.traceback) if einfo else "",
+                    )
+                    db.add(dlq_item)
+                    await db.commit()
+                    logger.critical(f"Task {self.name} [{task_id}] permanently failed. Routed to DLQ.")
+                except Exception as dlq_err:
+                    logger.error(f"Failed to write to DLQ for task {task_id}: {dlq_err}")
+
+        self.run_in_loop(_log_dlq())
+        super().on_failure(exc, task_id, args, kwargs, einfo)
 
 
 @celery_app.task(bind=True, base=DBTask, name="app.services.tasks.profile_dataset_task",
@@ -53,7 +94,7 @@ def profile_dataset_task(self, dataset_id: int, user_id: int, job_id: int, **kwa
 
     async def _run():
         from ..database import AsyncSessionLocal
-        from ..models import Dataset, Job
+        from app.models import Dataset, Job
         from sqlalchemy import select
 
         async with AsyncSessionLocal() as db:
@@ -115,7 +156,7 @@ def execute_pipeline_task(self, execution_id: int, pipeline_id: int, dataset_id:
 
     async def _run():
         from ..database import AsyncSessionLocal
-        from ..models import Dataset, Job, PipelineExecution
+        from app.models import Dataset, Job, PipelineExecution
         from sqlalchemy import select, update
 
         async with AsyncSessionLocal() as db:
@@ -281,7 +322,7 @@ def execute_pipeline_task(self, execution_id: int, pipeline_id: int, dataset_id:
         def _fail_job():
             async def _inner():
                 from ..database import AsyncSessionLocal
-                from ..models import Job, PipelineExecution
+                from app.models import Job, PipelineExecution
                 from sqlalchemy import select
                 async with AsyncSessionLocal() as db_fail:
                     r = await db_fail.execute(select(PipelineExecution).where(PipelineExecution.id == execution_id))
@@ -308,7 +349,7 @@ def execute_pipeline_task(self, execution_id: int, pipeline_id: int, dataset_id:
 def recover_stale_executions():
     async def _run():
         from ..database import AsyncSessionLocal
-        from ..models import PipelineExecution
+        from app.models import PipelineExecution
         from sqlalchemy import select
         threshold = datetime.now(UTC) - timedelta(seconds=settings.JOB_HARD_TIME_LIMIT)
         async with AsyncSessionLocal() as db:
@@ -343,7 +384,7 @@ def cleanup_expired_idempotency():
 def cleanup_old_login_attempts():
     async def _run():
         from ..database import AsyncSessionLocal
-        from ..models import LoginAttempt
+        from app.models import LoginAttempt
         from sqlalchemy import delete
         cutoff = datetime.now(UTC) - timedelta(days=30)
         async with AsyncSessionLocal() as db:

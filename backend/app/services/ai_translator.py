@@ -2,7 +2,8 @@
 import json
 import logging
 import httpx
-from ..config import get_settings
+from app.config import get_settings
+from .reliability import with_retry_and_circuit, llm_circuit_breaker
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ Allowed param keys ONLY: columns (string[]), method (string), threshold (number|
 No other keys. No explanation. No markdown."""
 
 
+@with_retry_and_circuit(llm_circuit_breaker, exceptions=(httpx.RequestError, httpx.HTTPStatusError), max_retries=3)
 async def translate_to_steps(prompt: str, dataset_columns: list[str] | None = None) -> dict:
     """Returns raw parsed JSON from the AI. Never raises — returns {steps:[]} on any failure."""
     if not settings.ANTHROPIC_API_KEY:

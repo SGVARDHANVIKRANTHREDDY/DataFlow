@@ -81,15 +81,23 @@ class StructuredLoggingMiddleware(BaseHTTPMiddleware):
             )
             raise
 
+import json
+
+class JSONLogFormatter(logging.Formatter):
+    def format(self, record):
+        log_obj = {'timestamp': self.formatTime(record, self.datefmt),'level': record.levelname,'logger': record.name,'message': record.getMessage(),'request_id': getattr(record, 'request_id', '-'),'tenant_id': getattr(record, 'tenant_id', '-'),}
+        if record.exc_info:
+            log_obj['exception'] = self.formatException(record.exc_info)
+        return json.dumps(log_obj)
+
 def setup_logging(debug: bool) -> None:
-    """Configures systemic log levels and format injected with tenant ids."""
     level = logging.DEBUG if debug else logging.INFO
-    log_format = "%(asctime)s - %(name)s - %(levelname)s - [req:%(request_id)s] [tenant:%(tenant_id)s] - %(message)s"
-    
-    # Configure root logger
-    logging.basicConfig(level=level, format=log_format)
-    
-    # Add filter to all existing handlers
+    handler = logging.StreamHandler()
+    handler.setFormatter(JSONLogFormatter())
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+    root_logger.addHandler(handler)
     tenant_filter = TenantLogFilter()
-    for handler in logging.root.handlers:
-        handler.addFilter(tenant_filter)
+    handler.addFilter(tenant_filter)

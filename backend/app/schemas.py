@@ -23,10 +23,19 @@ class ErrorResponse(BaseModel):
 # ── Auth ─────────────────────────────────────────────────────
 class UserRegister(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
+    password: str = Field(
+        min_length=8, 
+        max_length=128, 
+        description="Password must contain at least one lowercase letter, one uppercase letter, and one digit."
+    )
 
-    @field_validator("password")
+    @field_validator('password')
     @classmethod
+    def validate_password(cls, v: str) -> str:
+        import re
+        if not re.search(r'(?=.*[a-z])(?=.*[A-Z])(?=.*\d).*$', v):
+            raise ValueError('Password must contain at least one lowercase letter, one uppercase letter, and one digit.')
+        return v
     def password_strength(cls, v: str) -> str:
         if not any(c.isupper() for c in v):
             raise ValueError("Password must contain at least one uppercase letter")
@@ -37,7 +46,7 @@ class UserRegister(BaseModel):
 
 class UserLogin(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(max_length=128)
 
 
 class UserOut(BaseModel):
@@ -90,10 +99,10 @@ ALLOWED_ACTIONS = frozenset({
 
 
 class StepParams(BaseModel):
-    columns: list[str] = Field(default_factory=list)
-    method: str = ""
-    threshold: float | None = None
-    order: str = ""
+    columns: list[str] = Field(default_factory=list, max_item_length=100)
+    method: str = Field("", max_length=50, pattern=r"^[a-zA-Z0-9_\-\.]*$")
+    threshold: float | None = Field(None, ge=-1e9, le=1e9)
+    order: str = Field("", max_length=4)
 
     @field_validator("order")
     @classmethod

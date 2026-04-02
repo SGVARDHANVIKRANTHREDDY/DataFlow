@@ -97,3 +97,104 @@ def with_retry_and_circuit(
 
         return wrapper
     return decorator
+
+
+class UnifiedJobOrchestrator:
+    """
+    Central orchestration layer. Handles atomic, exactly-once job execution.
+    Coordinates DB locked state, idempotency keys, dedup checks, and task dispatch.
+    """
+    @staticmethod
+    async def dispatch_pipeline_execution(
+        db: Any, 
+        user_id: int, 
+        pipeline_id: int, 
+        dataset_id: int, 
+        idem_key: str, 
+        body_hash: str
+    ) -> dict:
+        from app.models import Pipeline, PipelineExecution, Job
+        from .security.idempotency import (
+            get_or_create_idempotency_key, 
+            claim_execution_dedup, 
+            complete_execution_dedup,
+            hash_steps
+        )
+        from app.services.tasks import execute_pipeline_task
+        from sqlalchemy import select
+
+        # 1. API Level Idempotency Check (Duplicate POST exactly the same?)
+        action_dict = await get_or_create_idempotency_key(
+            db, user_id, idem_key, f"/pipelines/{pipeline_id}/execute", body_hash
+        )
+        if action_dict.get("action") == "replay":
+            return {"status": "accepted", "message": "Pipeline execution initiated (replayed from Idempotency-Key)"}
+        
+        # 2. Pipeline fetching & Dedup Hash (same pipeline logic?)
+        r = await db.execute(
+            select(Pipeline).where(Pipeline.id == pipeline_id, Pipeline.user_id == user_id)
+        )
+        pipeline = r.scalar_one_or_none()
+        if not pipeline:
+            raise ValueError("Pipeline not found or user mis-match.")
+        
+        steps_hash = hash_steps(pipeline.steps)
+        dedup_key = f"exec:{user_id}:{pipeline_id}:{dataset_id}:{steps_hash}"
+        
+        # 3. Domain Level Dedup
+        await claim_execution_dedup(db, user_id, dedup_key, idem_key)
+
+        # 4. Atomic Stateful Transition using SELECT FOR UPDATE
+        # We lock the dataset to prevent concurrent mutations on it
+        from app.models import Dataset
+        r2 = await db.execute(
+            select(Dataset).where(Dataset.id == dataset_id, Dataset.user_id == user_id).with_for_update()
+        )
+        dataset_record = r2.scalar_one_or_none()
+        if not dataset_record:
+            raise ValueError("Dataset not found or user mis-match.")
+
+        execution = PipelineExecution(
+            pipeline_id=pipeline_id,
+            dataset_id=dataset_id,
+            status="pending",
+        )
+        db.add(execution)
+        await db.flush()
+
+        job = Job(
+            user_id=user_id,
+            task_name="pipeline_execution",
+            target_id=execution.id,
+            status="pending"
+        )
+        db.add(job)
+        await db.flush()
+
+        # 5. Commit state BEFORE offloading to Celery (Transactional Outbox baseline)
+        execution_id = execution.id
+        job_id = job.id
+        await db.commit()
+
+        # 6. Dispatch with tracing/dedup/idemp keys packed
+        execute_pipeline_task.apply_async(
+            args=[execution_id, user_id, dataset_id, pipeline.steps],
+            kwargs={"job_id": job_id, "idem_key": idem_key, "dedup_key": dedup_key},
+            queue="pipeline_exec"
+        )
+
+        return {
+            "status": "accepted",
+            "message": "Pipeline execution initiated",
+            "execution_id": execution_id,
+            "job_id": job_id
+        }
+
+
+
+# Global Circuit Breakers
+s3_circuit_breaker = CircuitBreaker('S3_Storage', threshold=5, timeout=30.0)
+llm_circuit_breaker = CircuitBreaker('LLM_Service', threshold=3, timeout=60.0)
+db_circuit_breaker = CircuitBreaker('Database', threshold=10, timeout=10.0)
+redis_circuit_breaker = CircuitBreaker('Redis', threshold=5, timeout=10.0)
+

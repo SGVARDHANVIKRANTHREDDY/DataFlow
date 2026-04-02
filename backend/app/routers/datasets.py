@@ -20,7 +20,7 @@ from ..models import User, Dataset, Job
 from ..auth import get_current_user
 from ..schemas import DatasetOut, DatasetList
 from ..services.storage import (upload_file_async, upload_csv_from_df_async,
-                                  delete_object_async, generate_upload_key, download_file_to_df)
+                                  delete_object_async, generate_upload_key, download_to_df)
 from ..services.profiler import generate_smart_suggestions, detect_anomalies
 from ..services.tasks import profile_dataset_task
 from ..services.security.csv_sanitizer import validate_and_sanitize_csv, is_csv_content, SecurityError

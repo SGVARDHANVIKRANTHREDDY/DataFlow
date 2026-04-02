@@ -193,3 +193,35 @@ async def list_failed_jobs(request: Request, page: int = 1,
     )).scalars().all()
     return {"items": [{"id": j.id, "job_type": j.job_type, "error": j.error,
                        "created_at": j.created_at.isoformat()} for j in items], "total": total}
+
+
+@router.get('/dlq')
+async def list_dlq(db: AsyncSession = Depends(get_db)):
+    from ..models import DeadLetterQueue
+    result = await db.execute(select(DeadLetterQueue).order_by(DeadLetterQueue.created_at.desc()).limit(100))
+    items = result.scalars().all()
+    return items
+
+@router.post('/dlq/{dlq_id}/retry')
+async def retry_dlq(dlq_id: int, request: Request, db: AsyncSession = Depends(get_db)):
+    from ..models import DeadLetterQueue
+    import json
+    from ..celery_app import celery_app
+    result = await db.execute(select(DeadLetterQueue).where(DeadLetterQueue.id == dlq_id))
+    dlq_item = result.scalar_one_or_none()
+    if not dlq_item: raise HTTPException(404, 'DLQ item not found')
+    if dlq_item.status != 'pending': raise HTTPException(400, 'Only pending items can be retried')
+    
+    try:
+        payload = json.loads(dlq_item.payload)
+        args = payload.get('args', [])
+        kwargs = payload.get('kwargs', {})
+        # Push back into Celery
+        celery_app.send_task(dlq_item.task_name, args=args, kwargs=kwargs)
+        dlq_item.status = 'retried'
+        dlq_item.resolved_at = func.now()
+        await db.commit()
+        return {'status': 'retried'}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(500, f'Failed to re-drive DLQ: {e}')

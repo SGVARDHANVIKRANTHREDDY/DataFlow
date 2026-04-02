@@ -16,7 +16,7 @@ import asyncio
 import traceback as tb
 from datetime import datetime, timezone, timedelta
 from celery.signals import task_failure
-from ..config import get_settings
+from app.config import get_settings
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ async def record_dlq_entry(celery_task_id: str, task_name: str, queue: str,
                             traceback_str: str, retry_count: int) -> None:
     """Persist a dead letter entry to PostgreSQL."""
     from ..database import AsyncSessionLocal
-    from ..models import DeadLetterEntry
+    from app.models import DeadLetterEntry
 
     logger.error("DLQ_ENTRY task=%s id=%s queue=%s retries=%d error=%.200s",
                  task_name, celery_task_id, queue, retry_count, error)
@@ -59,7 +59,7 @@ async def replay_dlq_entry(entry_id: int, admin_user_id: int | None = None) -> d
     FIX: admin_user_id is now optional — admin.py called with 1 arg → TypeError in v7.
     """
     from ..database import AsyncSessionLocal
-    from ..models import DeadLetterEntry
+    from app.models import DeadLetterEntry
     from sqlalchemy import select
     from ..celery_app import celery_app
     from .security.audit import audit_sync, AuditAction
@@ -128,3 +128,40 @@ def connect_dlq_signal():
 
     _dlq_signal_connected = True
     logger.info("DLQ signal handler connected")
+import logging
+import json
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models import DeadLetterQueue
+from ..celery_app import celery_app
+
+logger = logging.getLogger(__name__)
+
+async def replay_dlq_entry(db: AsyncSession, dlq_id: int) -> dict:
+    result = await db.execute(select(DeadLetterQueue).where(DeadLetterQueue.id == dlq_id))
+    item = result.scalar_one_or_none()
+    if not item:
+        raise ValueError('DLQ entry not found')
+    if item.status != 'pending':
+        raise ValueError('Entry is not in pending state')
+    
+    logger.info('Replaying DLQ item %s for task %s', dlq_id, item.task_name)
+    try:
+        payload = json.loads(item.payload)
+    except Exception as e:
+        item.status = 'dropped'
+        item.error_message = f'Failed to parse payload: {e}'
+        await db.commit()
+        raise ValueError('Corrupted DLQ payload, dropping entry')
+        
+    args = payload.get('args', [])
+    kwargs = payload.get('kwargs', {})
+    
+    # Re-enqueue the task
+    celery_app.send_task(item.task_name, args=args, kwargs=kwargs)
+    
+    import datetime
+    item.status = 'resolved'
+    item.resolved_at = datetime.datetime.utcnow()
+    await db.commit()
+    return {'status': 'enqueued', 'dlq_id': dlq_id, 'task_name': item.task_name}

@@ -48,3 +48,7 @@ def setup_otel(app: FastAPI) -> None:
         logger.info("OpenTelemetry instrumentation enabled.")
     except ImportError:
         logger.warning("OpenTelemetry missing — distribute tracing spans are disabled.")
+def extract_trace_from_celery_kwargs(kwargs: dict) -> dict:
+    return {}
+def inject_trace_into_celery_kwargs(kwargs: dict) -> dict:
+    return kwargs

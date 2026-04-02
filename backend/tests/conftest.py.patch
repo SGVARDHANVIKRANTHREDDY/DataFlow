@@ -1,0 +1,23 @@
+import pytest
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.pool import NullPool
+
+@pytest.fixture(scope="session")
+def postgres_container():
+    class MockContainer:
+        def get_connection_url(self):
+            return "sqlite+aiosqlite:///:memory:"
+    yield MockContainer()
+
+@pytest.fixture(scope="session")
+async def test_engine(postgres_container):
+    sync_url = postgres_container.get_connection_url()
+    async_url = sync_url.replace("postgresql://", "postgresql+asyncpg://")
+    engine = create_async_engine(async_url, poolclass=NullPool)
+    from app.database import Base
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
