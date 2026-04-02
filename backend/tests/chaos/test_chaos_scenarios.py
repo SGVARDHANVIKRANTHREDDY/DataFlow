@@ -13,6 +13,41 @@ Tests:
 """
 import pytest
 import asyncio
+from unittest.mock import patch, MagicMock
+from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import HTTPException
+from app.routers.datasets import _upload_semaphore, _do_upload
+from app.models import User
+
+@pytest.mark.asyncio
+async def test_concurrency_guardrails_upload_semaphore():
+    """
+    FAANG FAULT TOLERANCE: Validate Strict Concurrency Caps on Uploads.
+    If X concurrent large uploads hit the node, the bounding semaphore 
+    should block requests that exceed OOM thresholds and degrade gracefully 
+    (HTTP 503) instead of memory-crashing the container.
+    """
+    mock_request = MagicMock()
+    mock_request.headers = {"content-length": "1000"}  # Well under max
+    mock_request.form = AsyncMock() # Mock form parsing
+    mock_db = MagicMock(spec=AsyncSession)
+    mock_user = User(id=77)
+
+    # Use a tiny semaphore pool for testing
+    test_semaphore = asyncio.Semaphore(2)
+
+    # Use patch context managers for testing
+    with patch("app.routers.datasets._upload_semaphore", asyncio.Semaphore(0)):
+        # The semaphore is fully exhausted (0). 
+        # The request MUST immediately bounce explicitly with 503
+        # due to bounded queue exhaustion. This prevents Node OOM starvation.
+        with pytest.raises(HTTPException) as exc_info:
+            from app.routers.datasets import upload_dataset
+            await upload_dataset(mock_request, mock_db, mock_user)
+
+        assert exc_info.value.status_code == 503
+        assert "Upload queue full" in str(exc_info.value.detail)
+import asyncio
 import time
 import pandas as pd
 from unittest.mock import patch, MagicMock, AsyncMock

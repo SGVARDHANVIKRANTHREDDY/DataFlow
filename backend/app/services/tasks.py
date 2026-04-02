@@ -126,13 +126,27 @@ def execute_pipeline_task(self, execution_id: int, pipeline_id: int, dataset_id:
                 if ex and ex.status == "completed":
                     logger.info("[TASK:%s] Execution %d already completed — skip", self.request.id, execution_id)
                     return {"status": ex.status, "output_row_count": ex.output_row_count, "cached": True}
-                if ex and ex.status == "running" and ex.locked_by and ex.locked_by != WORKER_ID:
-                    return {"skipped": True, "reason": "locked_by_other_worker"}
+                
+                # Check for dead locks (if another worker died while holding lock)
+                stale_threshold = datetime.now(UTC) - timedelta(minutes=settings.PIPELINE_LOCK_EXPIRY_MINUTES if hasattr(settings, "PIPELINE_LOCK_EXPIRY_MINUTES") else 15)
+                
+                if ex and ex.status == "running":
+                    if ex.locked_by and ex.locked_by != WORKER_ID:
+                        if ex.locked_at and ex.locked_at > stale_threshold:
+                            logger.info("[TASK:%s] Execution %d locked by %s — skip", self.request.id, execution_id, ex.locked_by)
+                            return {"skipped": True, "reason": f"locked_by_{ex.locked_by}"}
+                        else:
+                            logger.warning("[TASK:%s] Execution %d has stale lock from %s, breaking lock.", self.request.id, execution_id, ex.locked_by)
+                            # Let it proceed to lock_result
 
+                # State transition: pending/stale -> running. Do NOT hold this transaction open while processing! 
                 lock_result = await db.execute(
                     update(PipelineExecution)
-                    .where(PipelineExecution.id == execution_id, PipelineExecution.status == "pending")
-                    .values(locked_by=WORKER_ID, locked_at=datetime.now(UTC), status="running")
+                    .where(
+                        (PipelineExecution.id == execution_id) & 
+                        ((PipelineExecution.status == "pending") | (PipelineExecution.status == "running"))
+                    )
+                    .values(locked_by=WORKER_ID, locked_at=datetime.now(UTC), status="running", retry_count=PipelineExecution.retry_count + 1)
                     .returning(PipelineExecution.id)
                 )
                 if lock_result.scalar_one_or_none() is None:
@@ -141,13 +155,70 @@ def execute_pipeline_task(self, execution_id: int, pipeline_id: int, dataset_id:
                 r = await db.execute(select(Job).where(Job.id == job_id))
                 job = r.scalar_one_or_none()
                 if job:
-                    job.status = "running"; job.celery_task_id = self.request.id
+                    job.status = "running"
+                    job.celery_task_id = self.request.id
                     job.started_at = datetime.now(UTC)
-                await db.flush()
-
+                
                 r = await db.execute(select(Dataset).where(Dataset.id == dataset_id, Dataset.user_id == user_id))
                 ds = r.scalar_one_or_none()
                 if not ds: raise ValueError(f"Dataset {dataset_id} not found")
+                
+                # Commit the "running" state immediately to release row locks and avoid network I/O in transaction.
+                await db.commit()
+                
+            except Exception:
+                await db.rollback()
+                raise
+                
+        # --- OUTSIDE DB TRANSACTION: Heavy I/O and Computation ---
+        logger.info("[TASK:%s] Downloading dataset %s for execution %d", self.request.id, ds.s3_key, execution_id)
+        df = await asyncio.to_thread(download_to_df, ds.s3_key, settings.S3_BUCKET_RAW)
+        
+        # Execute pipeline memory processing
+        logger.info("[TASK:%s] Processing execution %d (engine: Polars)", self.request.id, execution_id)
+        report, output_df = execute_pipeline(steps, df)
+        
+        if report.get("status") == "failed":
+            raise RuntimeError(f"Pipeline execution failed: {report.get('error')}")
+            
+        # Deterministic output key for Idempotent S3 Retry
+        output_key = f"tenant-{user_id}/outputs/exec-{execution_id}.csv"
+        
+        logger.info("[TASK:%s] Uploading execution %d result to %s", self.request.id, execution_id, output_key)
+        await asyncio.to_thread(upload_csv_from_df_sync, output_df, output_key, settings.S3_BUCKET_PROCESSED)
+        
+        # --- RE-ENTER DB TRANSACTION: Finalize execution ---
+        async with AsyncSessionLocal() as db2:
+            try:
+                r2 = await db2.execute(select(PipelineExecution).where(PipelineExecution.id == execution_id))
+                ex2 = r2.scalar_one_or_none()
+                if ex2:
+                    ex2.status = "completed"
+                    ex2.report = report
+                    ex2.output_s3_key = output_key
+                    ex2.output_row_count = len(output_df)
+                    ex2.duration_ms = report.get("total_ms")
+                    ex2.completed_at = datetime.now(UTC)
+                
+                r2_job = await db2.execute(select(Job).where(Job.id == job_id))
+                job2 = r2_job.scalar_one_or_none()
+                if job2:
+                    job2.status = "completed"
+                    job2.result = report
+                    job2.progress = 100
+                    job2.completed_at = datetime.now(UTC)
+                    
+                await db2.commit()
+                audit_sync(
+                    AuditAction.PIPELINE_EXECUTED if hasattr(AuditAction, "PIPELINE_EXECUTED") else AuditAction.DATASET_PROFILED, 
+                    user_id=user_id,
+                    detail={"execution_id": execution_id, "trace_id": trace_id, "output_key": output_key}
+                )
+                return {"status": "completed", "output_row_count": len(output_df)}
+            except Exception:
+                await db2.rollback()
+                raise
+
 
                 df = await asyncio.to_thread(download_to_df, ds.s3_key, settings.S3_BUCKET_RAW)
                 cols = list(df.columns)
@@ -206,6 +277,30 @@ def execute_pipeline_task(self, execution_id: int, pipeline_id: int, dataset_id:
     except SoftTimeLimitExceeded: raise
     except Exception as exc:
         logger.exception("[TASK:%s] Execution failed: %s", self.request.id, exc)
+        # Re-enter DB transaction to mark as failed
+        def _fail_job():
+            async def _inner():
+                from ..database import AsyncSessionLocal
+                from ..models import Job, PipelineExecution
+                from sqlalchemy import select
+                async with AsyncSessionLocal() as db_fail:
+                    r = await db_fail.execute(select(PipelineExecution).where(PipelineExecution.id == execution_id))
+                    ex = r.scalar_one_or_none()
+                    if ex and ex.status != "completed":
+                        ex.status = "failed"
+                        ex.error_detail = str(exc)
+                        ex.completed_at = datetime.now(UTC)
+                    r_job = await db_fail.execute(select(Job).where(Job.id == job_id))
+                    job = r_job.scalar_one_or_none()
+                    if job and job.status != "completed":
+                        job.status = "failed"
+                        job.error = str(exc)
+                        job.completed_at = datetime.now(UTC)
+                    await db_fail.commit()
+            loop = asyncio.new_event_loop()
+            try: return loop.run_until_complete(_inner())
+            finally: loop.close()
+        _fail_job()
         raise self.retry(exc=exc, countdown=settings.JOB_RETRY_BACKOFF)
 
 

@@ -220,13 +220,14 @@ async def compare_datasets(
     user: User = Depends(get_current_user)
 ):
     """
-    Returns a high-level statistical comparison between two datasets
+    Returns a high-level statistical comparison between two datasets.
+    Properly isolates by tenant (user_id).
     """
     ds1 = await db.get(Dataset, id1)
     ds2 = await db.get(Dataset, id2)
     
-    if not ds1 or not ds2 or ds1.owner_id != user.id or ds2.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="One or both datasets not found or unauthorized")
+    if not ds1 or not ds2 or ds1.user_id != user.id or ds2.user_id != user.id:
+        raise HTTPException(status_code=404, detail="One or both datasets not found")
         
     def _extract_stats(ds: Dataset):
         if not ds.profile:
@@ -235,12 +236,12 @@ async def compare_datasets(
         return {
             "ready": True,
             "name": ds.name,
-            "health_score": p.health_score,
-            "row_count": p.row_count,
-            "col_count": p.col_count,
-            "memory_usage": p.memory_usage_mb,
-            "missing_cells": p.missing_cells,
-            "duplicate_rows": p.duplicate_rows,
+            "health_score": p.get("health_score"),
+            "row_count": ds.row_count,
+            "col_count": ds.col_count,
+            "missing_cells": p.get("missing_cells"),
+            "duplicate_rows": p.get("duplicate_rows"),
+            "memory_usage_mb": p.get("memory_usage_mb"),
         }
 
     return {
@@ -257,11 +258,19 @@ async def get_dataset_anomalies(
     """
     On-demand lightweight Anomaly Detection scan on the dataset CSV, 
     identifying highly-deviant rows using Max Z-Score evaluation.
+    Properly enforced tenant isolation inside _req_ds.
     """
     ds = await _req_ds(db, dataset_id, user.id)
-    df = await download_file_to_df(ds.s3_key)
-    anomalies = detect_anomalies(df)
-    return {"anomalies": anomalies, "total_scanned": len(df)}
+    
+    # Needs to use the correct S3 download method and handle errors gracefully
+    try:
+        from ..services.storage import download_to_df
+        df = await download_to_df(ds.s3_key, settings.S3_BUCKET_RAW)
+        anomalies = detect_anomalies(df)
+        return {"anomalies": anomalies, "total_scanned": len(df)}
+    except Exception as e:
+        logger.error("Failed to download dataset %d for anomaly detection: %s", dataset_id, e)
+        raise HTTPException(502, "Storage unavailable — please retry")
 
 
 @router.delete("/{dataset_id}", status_code=204)

@@ -44,12 +44,25 @@ def execute_pipeline(
     log: list[dict[str, Any]] = []
 
     input_count = len(df)
+    
+    # HARD GUARDRAILS against Memory OOM / DoS
+    # FAANG standard practice is strict memory and row constraints at edge
+    if input_count > 10_000_000:
+        logger.error("Dataset exceeds 10M hard limit (Count: %d). Rejecting execution.", input_count)
+        return {
+            "status": "failed",
+            "steps_total": len(steps),
+            "steps_ok": 0,
+            "steps_failed": 0,
+            "error": f"Hard limit exceeded. Got {input_count} rows, max 10,000,000 for standard tier.",
+        }, df
+
     use_streaming = input_count > STREAMING_THRESHOLD
 
     if use_streaming:
-        logger.info("Using Polars streaming mode for %d rows", input_count)
+        logger.info("Using Polars streaming mode for execution over %d rows to bound memory bounds to O(chunk)", input_count)
 
-    # Convert pandas → polars LazyFrame (zero-copy via Arrow)
+    # Convert pandas → polars LazyFrame (zero-copy via Arrow where possible)
     try:
         current_lf = pl.from_pandas(df).lazy()
     except Exception as e:
@@ -69,65 +82,93 @@ def execute_pipeline(
     last_good_lf = current_lf
     last_good_count = input_count
 
+    # Try importing OpenTelemetry tracer for dense telemetry
+    try:
+        from opentelemetry import trace
+        tracer = trace.get_tracer(__name__)
+    except ImportError:
+        class DummySpan:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def set_attribute(self, *args): pass
+            def record_exception(self, *args): pass
+        class DummyTracer:
+            def start_as_current_span(self, *args, **kwargs): return DummySpan()
+        tracer = DummyTracer()
+
     for i, step in enumerate(steps):
         action = step.get("action", "")
         params = step.get("params", {})
         fn     = ACTION_REGISTRY.get(action)
 
-        t_step = time.perf_counter()
-        rows_before = last_good_count
+        with tracer.start_as_current_span(f"pipeline.step.{action}") as span:
+            span.set_attribute("step.index", i)
+            span.set_attribute("step.action", action)
+            span.set_attribute("rows.before", last_good_count)
 
-        if fn is None:
-            ms = round((time.perf_counter() - t_step) * 1000, 2)
-            log.append({
-                "index": i, "action": action,
-                "rows_before": rows_before, "rows_after": rows_before,
-                "delta": 0, "ms": ms,
-                "status": "error", "error": f"Unknown action: '{action}'",
-            })
-            logger.warning("Step %d: unknown action '%s'", i, action)
-            continue
+            t_step = time.perf_counter()
+            rows_before = last_good_count
 
-        try:
-            result_lf = fn(current_lf, params)
+            if fn is None:
+                ms = round((time.perf_counter() - t_step) * 1000, 2)
+                span.set_attribute("error", True)
+                span.set_attribute("error.message", f"Unknown action: '{action}'")
+                log.append({
+                    "index": i, "action": action,
+                    "rows_before": rows_before, "rows_after": rows_before,
+                    "delta": 0, "ms": ms,
+                    "status": "error", "error": f"Unknown action: '{action}'",
+                })
+                logger.warning("Step %d: unknown action '%s'", i, action)
+                continue
 
-            # Materialize this step to get row count for the log
-            # (lazy — this doesn't re-execute previous steps)
-            if use_streaming:
-                result_df_check = result_lf.collect(streaming=True)
-            else:
-                result_df_check = result_lf.collect()
+            try:
+                result_lf = fn(current_lf, params)
 
-            rows_after = len(result_df_check)
-            ms = round((time.perf_counter() - t_step) * 1000, 2)
+                # Materialize this step to get row count for the log
+                # (lazy — this doesn't re-execute previous steps)
+                if use_streaming:
+                    result_df_check = result_lf.collect(streaming=True)
+                else:
+                    result_df_check = result_lf.collect()
 
-            log.append({
-                "index": i, "action": action,
-                "rows_before": rows_before,
-                "rows_after": rows_after,
-                "delta": rows_after - rows_before,
-                "ms": ms, "status": "ok", "error": None,
-            })
+                rows_after = len(result_df_check)
+                ms = round((time.perf_counter() - t_step) * 1000, 2)
+                span.set_attribute("rows.after", rows_after)
+                span.set_attribute("duration.ms", ms)
 
-            # Update current state from the already-collected result
-            current_lf    = result_df_check.lazy()
-            last_good_lf  = current_lf
-            last_good_count = rows_after
+                log.append({
+                    "index": i, "action": action,
+                    "rows_before": rows_before,
+                    "rows_after": rows_after,
+                    "delta": rows_after - rows_before,
+                    "ms": ms, "status": "ok", "error": None,
+                })
 
-        except Exception as exc:
-            ms = round((time.perf_counter() - t_step) * 1000, 2)
-            log.append({
-                "index": i, "action": action,
-                "rows_before": rows_before, "rows_after": rows_before,
-                "delta": 0, "ms": ms,
-                "status": "error", "error": str(exc),
-            })
-            logger.warning("Step %d '%s' failed: %s", i, action, exc)
-            # Continue from last successful state — no corruption
-            current_lf = last_good_lf
+                # Update current state from the already-collected result
+                current_lf    = result_df_check.lazy()
+                last_good_lf  = current_lf
+                last_good_count = rows_after
+
+            except Exception as exc:
+                ms = round((time.perf_counter() - t_step) * 1000, 2)
+                span.record_exception(exc)
+                span.set_attribute("error", True)
+                span.set_attribute("duration.ms", ms)
+
+                log.append({
+                    "index": i, "action": action,
+                    "rows_before": rows_before, "rows_after": rows_before,
+                    "delta": 0, "ms": ms,
+                    "status": "error", "error": str(exc),
+                })
+                logger.warning("Step %d '%s' failed: %s", i, action, exc)
+                # Continue from last successful state — no corruption
+                current_lf = last_good_lf
 
     # Final collect
-    try:
+    with tracer.start_as_current_span(f"pipeline.final_collect") as span:
+        try:
         if use_streaming:
             final_polars = last_good_lf.collect(streaming=True)
         else:

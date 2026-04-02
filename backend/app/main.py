@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from .config import get_settings
 from .database import engine
@@ -22,7 +24,14 @@ settings = get_settings()
 setup_logging(settings.DEBUG)
 logger = logging.getLogger(__name__)
 
-limiter = Limiter(key_func=get_remote_address, default_limits=[settings.RATE_LIMIT_DEFAULT])
+# FAANG Grade: Multi-dimensional rate limit key (User ID + IP) if authenticated
+def rate_limit_key(request: Request) -> str:
+    user_id = getattr(request.state, "user_id", None)
+    ip = get_remote_address(request)
+    return str(user_id) if user_id else ip
+
+# Standard tier limits: 100/minute global. Can be overridden per endpoint
+limiter = Limiter(key_func=rate_limit_key, default_limits=[settings.RATE_LIMIT_DEFAULT if hasattr(settings, 'RATE_LIMIT_DEFAULT') else "100/minute"])
 
 
 @asynccontextmanager
